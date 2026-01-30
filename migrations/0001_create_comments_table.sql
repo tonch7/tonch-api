@@ -1,14 +1,9 @@
--- Migration number: 0001 	 2024-12-27T22:04:18.794Z
-CREATE TABLE IF NOT EXISTS comments (
-    id INTEGER PRIMARY KEY NOT NULL,
-    author TEXT NOT NULL,
-    content TEXT NOT NULL
+CREATE TABLE installations (
+    machine_id TEXT PRIMARY KEY,
+    first_seen_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    last_seen_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    activated INTEGER DEFAULT 0,
+    blocked INTEGER DEFAULT 0,
+    expires_at TEXT,
+    notes TEXT
 );
-
--- Insert some sample data into our comments table.
-INSERT INTO comments (author, content)
-VALUES
-    ('Kristian', 'Congrats!'),
-    ('Serena', 'Great job!'),
-    ('Max', 'Keep up the good work!')
-;
