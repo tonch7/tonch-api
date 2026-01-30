@@ -1,16 +1,12 @@
-{
-	"compatibility_date": "2025-10-08",
-	"main": "src/index.js",
-	"name": "tonch-api",
-	"upload_source_maps": true,
-	"d1_databases": [
-		{
-			"binding": "DB",
-			"database_id": "1c6af59e-c037-4258-88ad-a986464b086a",
-			"database_name": "tonch_licensing"
-		}
-	],
-	"observability": {
-		"enabled": true
-	}
-}
+name = "tonch-api"
+main = "src/index.js"
+compatibility_date = "2025-10-08"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "tonch_licensing"
+database_id = "1c6af59e-c037-4258-88ad-a986464b086a"
+migrations_dir = "migrations"
+
+[observability]
+enabled = true
