@@ -1,185 +1,288 @@
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    const path = url.pathname;
-    const method = request.method;
-
-    // CORS
-    if (method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders() });
-    }
-
-    const json = (obj, status = 200) =>
-      new Response(JSON.stringify(obj), {
+// Helper para respostas JSON
+const jsonResponse = (data, status = 200) => {
+    return new Response(JSON.stringify(data), {
         status,
-        headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders() },
-      });
-
-    const nowIso = () => new Date().toISOString();
-
-    try {
-      if (!env.DB) return json({ ok: false, error: "DB_binding_missing" }, 500);
-
-      // cria tabela (idempotente)
-      await env.DB.exec(`
-        CREATE TABLE IF NOT EXISTS installations (
-          machine_id   TEXT PRIMARY KEY,
-          first_seen_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-          last_seen_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-          activated    INTEGER DEFAULT 0,
-          blocked      INTEGER DEFAULT 0,
-          expires_at   TEXT,
-          notes        TEXT
-        );
-      `);
-
-      // GET /
-      if (path === "/" && method === "GET") {
-        return json({ ok: true, service: "tonch-licensing-api", build: "V3", ts: nowIso() });
-      }
-
-      // POST /register_install  { machine_id }
-      if (path === "/register_install" && method === "POST") {
-        const body = await request.json().catch(() => null);
-        const machine_id = String(body?.machine_id ?? "").trim();
-        if (!machine_id) return json({ ok: false, error: "machine_id_required" }, 400);
-
-        const now = nowIso();
-        await env.DB.prepare(`
-          INSERT INTO installations (machine_id, first_seen_at, last_seen_at, activated, blocked)
-          VALUES (?, ?, ?, 0, 0)
-          ON CONFLICT(machine_id) DO UPDATE SET last_seen_at=excluded.last_seen_at
-        `).bind(machine_id, now, now).run();
-
-        return json({ ok: true });
-      }
-
-      // GET /activation_status?machine_id=...
-      if (path === "/activation_status" && method === "GET") {
-        const machine_id = String(url.searchParams.get("machine_id") ?? "").trim();
-        if (!machine_id) return json({ ok: false, error: "machine_id_required" }, 400);
-
-        const row = await env.DB.prepare(`
-          SELECT machine_id, activated, blocked, expires_at
-          FROM installations
-          WHERE machine_id=?
-        `).bind(machine_id).first();
-
-        // marca presença sempre que consultar (se existir)
-        const touch = async () => {
-          await env.DB.prepare(`UPDATE installations SET last_seen_at=? WHERE machine_id=?`)
-            .bind(nowIso(), machine_id).run();
-        };
-
-        if (!row) {
-          return json({
-            ok: true,
-            activated: false,
-            blocked: false,
-            expires_at: null,
-            reason: "not_registered",
-          });
+        headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            ...corsHeaders()
         }
-
-        await touch();
-
-        // expiração
-        let expired = false;
-        if (row.expires_at) {
-          const ms = Date.parse(row.expires_at);
-          if (!Number.isNaN(ms)) expired = Date.now() > ms;
-        }
-
-        const blocked = !!row.blocked;
-        const activated = !!row.activated && !expired;
-
-        return json({
-          ok: true,
-          machine_id,
-          activated: activated && !blocked,
-          blocked,
-          expires_at: row.expires_at || null,
-          reason: blocked ? "blocked" : (expired ? "expired" : (activated ? "ok" : "not_activated")),
-        });
-      }
-
-      // ===== ADMIN =====
-      if (path.startsWith("/admin/")) {
-        const token = env.ADMIN_TOKEN;
-        if (!token) return json({ ok: false, error: "ADMIN_TOKEN_missing" }, 500);
-
-        const auth = request.headers.get("authorization") || "";
-        if (auth !== `Bearer ${token}`) {
-          return json({ ok: false, error: "unauthorized" }, 401);
-        }
-      }
-
-      // POST /admin/grant { machine_id, days }
-      if (path === "/admin/grant" && method === "POST") {
-        const body = await request.json().catch(() => null);
-        const machine_id = String(body?.machine_id ?? "").trim();
-        const days = Number(body?.days ?? 365);
-
-        if (!machine_id) return json({ ok: false, error: "machine_id_required" }, 400);
-        if (!Number.isFinite(days) || days < 1 || days > 3650) {
-          return json({ ok: false, error: "invalid_days" }, 400);
-        }
-
-        const expires_at = new Date(Date.now() + days * 86400000).toISOString();
-        const now = nowIso();
-
-        await env.DB.prepare(`
-          INSERT INTO installations (machine_id, first_seen_at, last_seen_at, activated, blocked, expires_at)
-          VALUES (?, ?, ?, 1, 0, ?)
-          ON CONFLICT(machine_id) DO UPDATE SET
-            activated=1,
-            blocked=0,
-            expires_at=excluded.expires_at,
-            last_seen_at=excluded.last_seen_at
-        `).bind(machine_id, now, now, expires_at).run();
-
-        return json({ ok: true, machine_id, expires_at });
-      }
-
-      // POST /admin/block { machine_id, blocked:true/false }
-      if (path === "/admin/block" && method === "POST") {
-        const body = await request.json().catch(() => null);
-        const machine_id = String(body?.machine_id ?? "").trim();
-        const blocked = !!body?.blocked;
-
-        if (!machine_id) return json({ ok: false, error: "machine_id_required" }, 400);
-
-        await env.DB.prepare(`
-          UPDATE installations SET blocked=?, last_seen_at=? WHERE machine_id=?
-        `).bind(blocked ? 1 : 0, nowIso(), machine_id).run();
-
-        return json({ ok: true, machine_id, blocked });
-      }
-
-      // GET /admin/installs
-      if (path === "/admin/installs" && method === "GET") {
-        const rows = await env.DB.prepare(`
-          SELECT machine_id, activated, blocked, expires_at, first_seen_at, last_seen_at, notes
-          FROM installations
-          ORDER BY last_seen_at DESC
-          LIMIT 300
-        `).all();
-
-        return json({ ok: true, items: rows.results || [] });
-      }
-
-      return json({ ok: false, error: "not_found", path, method }, 404);
-    } catch (e) {
-      return json({ ok: false, error: "worker_exception", detail: String(e?.message || e) }, 500);
-    }
-  },
+    });
 };
 
+// Headers CORS
 function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    "Access-Control-Max-Age": "86400",
-  };
+    return {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'Access-Control-Max-Age': '86400'
+    };
 }
+
+// Middleware de autenticação para rotas admin
+function requireAdmin(request, env) {
+    const token = env.ADMIN_TOKEN;
+    if (!token) {
+        throw new Error('ADMIN_TOKEN não configurado');
+    }
+    const authHeader = request.headers.get('Authorization');
+    if (authHeader !== `Bearer ${token}`) {
+        throw new Error('Não autorizado');
+    }
+}
+
+export default {
+    async fetch(request, env) {
+        const url = new URL(request.url);
+        const path = url.pathname;
+        const method = request.method;
+
+        // CORS preflight
+        if (method === 'OPTIONS') {
+            return new Response(null, {
+                status: 204,
+                headers: corsHeaders()
+            });
+        }
+
+        try {
+            // Verifica se o binding do banco de dados está disponível
+            if (!env.DB) {
+                throw new Error('Binding do banco de dados não disponível');
+            }
+
+            // Rota: Health check
+            if (path === '/' && method === 'GET') {
+                return jsonResponse({
+                    ok: true,
+                    service: 'tonch-licensing-api',
+                    version: 'v1.0.0',
+                    timestamp: new Date().toISOString()
+                });
+            }
+
+            // Rota: Registrar instalação
+            if (path === '/register_install' && method === 'POST') {
+                const body = await request.json();
+                const machineId = body.machine_id?.trim();
+
+                if (!machineId) {
+                    return jsonResponse({
+                        ok: false,
+                        error: 'machine_id_required'
+                    }, 400);
+                }
+
+                const now = new Date().toISOString();
+
+                // Insere ou atualiza a última vez visto
+                await env.DB.prepare(`
+                    INSERT INTO installations (machine_id, first_seen_at, last_seen_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(machine_id) DO UPDATE SET last_seen_at = ?
+                `).bind(machineId, now, now, now).run();
+
+                return jsonResponse({
+                    ok: true,
+                    message: 'Instalação registrada com sucesso'
+                });
+            }
+
+            // Rota: Consultar status de ativação
+            if (path === '/activation_status' && method === 'GET') {
+                const machineId = url.searchParams.get('machine_id')?.trim();
+
+                if (!machineId) {
+                    return jsonResponse({
+                        ok: false,
+                        error: 'machine_id_required'
+                    }, 400);
+                }
+
+                // Atualiza o last_seen_at
+                await env.DB.prepare(`
+                    UPDATE installations 
+                    SET last_seen_at = ?
+                    WHERE machine_id = ?
+                `).bind(new Date().toISOString(), machineId).run();
+
+                // Busca os dados da instalação
+                const installation = await env.DB.prepare(`
+                    SELECT machine_id, activated, blocked, expires_at
+                    FROM installations
+                    WHERE machine_id = ?
+                `).bind(machineId).first();
+
+                if (!installation) {
+                    return jsonResponse({
+                        ok: true,
+                        activated: false,
+                        blocked: false,
+                        expires_at: null,
+                        reason: 'not_registered'
+                    });
+                }
+
+                const { activated, blocked, expires_at } = installation;
+                let expired = false;
+                let reason = 'ok';
+
+                // Verifica se a licença expirou
+                if (expires_at) {
+                    const expiryDate = new Date(expires_at);
+                    expired = expiryDate < new Date();
+                }
+
+                if (blocked) {
+                    reason = 'blocked';
+                } else if (expired) {
+                    reason = 'expired';
+                } else if (!activated) {
+                    reason = 'not_activated';
+                }
+
+                return jsonResponse({
+                    ok: true,
+                    activated: activated && !expired && !blocked,
+                    blocked: Boolean(blocked),
+                    expires_at: expires_at || null,
+                    reason
+                });
+            }
+
+            // ================= ROTAS ADMINISTRATIVAS =================
+
+            // Rota: Conceder licença
+            if (path === '/admin/grant' && method === 'POST') {
+                try {
+                    requireAdmin(request, env);
+                } catch (authError) {
+                    return jsonResponse({
+                        ok: false,
+                        error: 'unauthorized',
+                        detail: authError.message
+                    }, 401);
+                }
+
+                const body = await request.json();
+                const machineId = body.machine_id?.trim();
+                const days = Number(body.days) || 365;
+
+                if (!machineId) {
+                    return jsonResponse({
+                        ok: false,
+                        error: 'machine_id_required'
+                    }, 400);
+                }
+
+                if (days < 1 || days > 3650) {
+                    return jsonResponse({
+                        ok: false,
+                        error: 'invalid_days',
+                        detail: 'Dias deve estar entre 1 e 3650'
+                    }, 400);
+                }
+
+                const now = new Date();
+                const expiresAt = new Date(now.getTime() + days * 86400000).toISOString();
+                const isoNow = now.toISOString();
+
+                await env.DB.prepare(`
+                    INSERT INTO installations (machine_id, activated, blocked, expires_at, first_seen_at, last_seen_at)
+                    VALUES (?, 1, 0, ?, ?, ?)
+                    ON CONFLICT(machine_id) DO UPDATE SET
+                        activated = 1,
+                        blocked = 0,
+                        expires_at = ?,
+                        last_seen_at = ?
+                `).bind(machineId, expiresAt, isoNow, isoNow, expiresAt, isoNow).run();
+
+                return jsonResponse({
+                    ok: true,
+                    message: 'Licença concedida com sucesso',
+                    machine_id: machineId,
+                    expires_at: expiresAt
+                });
+            }
+
+            // Rota: Bloquear/desbloquear instalação
+            if (path === '/admin/block' && method === 'POST') {
+                try {
+                    requireAdmin(request, env);
+                } catch (authError) {
+                    return jsonResponse({
+                        ok: false,
+                        error: 'unauthorized',
+                        detail: authError.message
+                    }, 401);
+                }
+
+                const body = await request.json();
+                const machineId = body.machine_id?.trim();
+                const blocked = Boolean(body.blocked);
+
+                if (!machineId) {
+                    return jsonResponse({
+                        ok: false,
+                        error: 'machine_id_required'
+                    }, 400);
+                }
+
+                await env.DB.prepare(`
+                    UPDATE installations
+                    SET blocked = ?, last_seen_at = ?
+                    WHERE machine_id = ?
+                `).bind(blocked ? 1 : 0, new Date().toISOString(), machineId).run();
+
+                return jsonResponse({
+                    ok: true,
+                    message: blocked ? 'Instalação bloqueada' : 'Instalação desbloqueada',
+                    machine_id: machineId,
+                    blocked
+                });
+            }
+
+            // Rota: Listar instalações
+            if (path === '/admin/installs' && method === 'GET') {
+                try {
+                    requireAdmin(request, env);
+                } catch (authError) {
+                    return jsonResponse({
+                        ok: false,
+                        error: 'unauthorized',
+                        detail: authError.message
+                    }, 401);
+                }
+
+                const installations = await env.DB.prepare(`
+                    SELECT machine_id, activated, blocked, expires_at, first_seen_at, last_seen_at, notes
+                    FROM installations
+                    ORDER BY last_seen_at DESC
+                    LIMIT 300
+                `).all();
+
+                return jsonResponse({
+                    ok: true,
+                    installations: installations.results || []
+                });
+            }
+
+            // Rota não encontrada
+            return jsonResponse({
+                ok: false,
+                error: 'not_found',
+                path,
+                method
+            }, 404);
+
+        } catch (error) {
+            console.error('Erro no worker:', error);
+
+            return jsonResponse({
+                ok: false,
+                error: 'worker_exception',
+                detail: error.message
+            }, 500);
+        }
+    }
+};
